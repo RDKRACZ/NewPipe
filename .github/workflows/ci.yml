@@ -6,115 +6,137 @@ on:
     branches:
       - dev
       - master
+      - refactor
+      - release**
     paths-ignore:
-      - 'README*.md'
+      - 'README.md'
+      - 'doc/**'
       - 'fastlane/**'
       - 'assets/**'
       - '.github/**/*.md'
+      - '.github/FUNDING.yml'
+      - '.github/ISSUE_TEMPLATE/**'
   push:
     branches:
       - dev
       - master
     paths-ignore:
-      - 'README*.md'
+      - 'README.md'
+      - 'doc/**'
       - 'fastlane/**'
       - 'assets/**'
       - '.github/**/*.md'
+      - '.github/FUNDING.yml'
+      - '.github/ISSUE_TEMPLATE/**'
 
 jobs:
   build-and-test-jvm:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
     steps:
-      - uses: actions/checkout@v2
-      - uses: gradle/wrapper-validation-action@v1
+      - uses: actions/checkout@v4
+      - uses: gradle/wrapper-validation-action@v2
 
       - name: create and checkout branch
         # push events already checked out the branch
         if: github.event_name == 'pull_request'
-        run: git checkout -B ${{ github.head_ref }}
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: git checkout -B "$BRANCH"
 
-      - name: set up JDK 8
-        uses: actions/setup-java@v2
+      - name: set up JDK
+        uses: actions/setup-java@v4
         with:
-          java-version: 8
-          distribution: "adopt"
+          java-version: 21
+          distribution: "temurin"
+          cache: 'gradle'
 
-      - name: Cache Gradle dependencies
-        uses: actions/cache@v2
-        with:
-          path: ~/.gradle/caches
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle') }}
-          restore-keys: ${{ runner.os }}-gradle
-          
       - name: Build debug APK and run jvm tests
         run: ./gradlew assembleDebug lintDebug testDebugUnitTest --stacktrace -DskipFormatKtlint
 
       - name: Upload APK
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: app
           path: app/build/outputs/apk/debug/*.apk
 
   test-android:
-    # macos has hardware acceleration. See android-emulator-runner action
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       matrix:
-        # api-level 19 is min sdk, but throws errors related to desugaring 
-        api-level: [ 21, 29 ]
+        include:
+          - api-level: 21
+            target: default
+            arch: x86
+          - api-level: 33
+            target: google_apis # emulator API 33 only exists with Google APIs
+            arch: x86_64
+
+    permissions:
+      contents: read
+
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-      - name: set up JDK 8
-        uses: actions/setup-java@v2
-        with:
-          java-version: 8
-          distribution: "adopt"
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
 
-      - name: Cache Gradle dependencies
-        uses: actions/cache@v2
+      - name: set up JDK
+        uses: actions/setup-java@v4
         with:
-          path: ~/.gradle/caches
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle') }}
-          restore-keys: ${{ runner.os }}-gradle
+          java-version: 21
+          distribution: "temurin"
+          cache: 'gradle'
 
       - name: Run android tests
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: ${{ matrix.api-level }}
-          # workaround to emulator bug: https://github.com/ReactiveCircus/android-emulator-runner/issues/160
-          emulator-build: 7425822
-          script: ./gradlew connectedCheck
+          target: ${{ matrix.target }}
+          arch: ${{ matrix.arch }}
+          script: ./gradlew connectedCheck --stacktrace
 
-#   sonar:
-#     runs-on: ubuntu-latest
-#     steps:
-#       - uses: actions/checkout@v2
-#         with:
-#           fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
+      - name: Upload test report when tests fail # because the printed out stacktrace (console) is too short, see also #7553
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: android-test-report-api${{ matrix.api-level }}
+          path: app/build/reports/androidTests/connected/**
 
-#       - name: Set up JDK 11
-#         uses: actions/setup-java@v2
-#         with:
-#           java-version: 11 # Sonar requires JDK 11
-#           distribution: "adopt"
+  sonar:
+    runs-on: ubuntu-latest
 
-#       - name: Cache SonarCloud packages
-#         uses: actions/cache@v2
-#         with:
-#           path: ~/.sonar/cache
-#           key: ${{ runner.os }}-sonar
-#           restore-keys: ${{ runner.os }}-sonar
+    permissions:
+      contents: read
 
-#       - name: Cache Gradle packages
-#         uses: actions/cache@v2
-#         with:
-#           path: ~/.gradle/caches
-#           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle') }}
-#           restore-keys: ${{ runner.os }}-gradle
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
 
-#       - name: Build and analyze
-#         env:
-#           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # Needed to get PR information, if any
-#           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-#         run: ./gradlew build sonarqube --info
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: 21
+          distribution: "temurin"
+          cache: 'gradle'
+
+      - name: Cache SonarCloud packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+
+      - name: Build and analyze
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # Needed to get PR information, if any
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: ./gradlew build sonar --info

@@ -19,13 +19,18 @@
 
 package org.schabi.newpipe.local.subscription.services;
 
+import static org.schabi.newpipe.MainActivity.DEBUG;
+import static org.schabi.newpipe.streams.io.StoredFileHelper.DEFAULT_MIME;
+
 import android.content.Intent;
 import android.net.Uri;
 import android.text.TextUtils;
 import android.util.Log;
+import android.util.Pair;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.core.content.IntentCompat;
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
 import org.reactivestreams.Subscriber;
@@ -35,6 +40,7 @@ import org.schabi.newpipe.R;
 import org.schabi.newpipe.database.subscription.SubscriptionEntity;
 import org.schabi.newpipe.extractor.NewPipe;
 import org.schabi.newpipe.extractor.channel.ChannelInfo;
+import org.schabi.newpipe.extractor.channel.tabs.ChannelTabInfo;
 import org.schabi.newpipe.extractor.subscription.SubscriptionItem;
 import org.schabi.newpipe.ktx.ExceptionUtils;
 import org.schabi.newpipe.streams.io.SharpInputStream;
@@ -45,7 +51,9 @@ import org.schabi.newpipe.util.ExtractorHelper;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 
 import io.reactivex.rxjava3.android.schedulers.AndroidSchedulers;
 import io.reactivex.rxjava3.core.Flowable;
@@ -53,9 +61,6 @@ import io.reactivex.rxjava3.core.Notification;
 import io.reactivex.rxjava3.functions.Consumer;
 import io.reactivex.rxjava3.functions.Function;
 import io.reactivex.rxjava3.schedulers.Schedulers;
-
-import static org.schabi.newpipe.MainActivity.DEBUG;
-import static org.schabi.newpipe.streams.io.StoredFileHelper.DEFAULT_MIME;
 
 public class SubscriptionsImportService extends BaseImportExportService {
     public static final int CHANNEL_URL_MODE = 0;
@@ -89,6 +94,8 @@ public class SubscriptionsImportService extends BaseImportExportService {
     private String channelUrl;
     @Nullable
     private InputStream inputStream;
+    @Nullable
+    private String inputStreamType;
 
     @Override
     public int onStartCommand(final Intent intent, final int flags, final int startId) {
@@ -102,7 +109,7 @@ public class SubscriptionsImportService extends BaseImportExportService {
         if (currentMode == CHANNEL_URL_MODE) {
             channelUrl = intent.getStringExtra(KEY_VALUE);
         } else {
-            final Uri uri = intent.getParcelableExtra(KEY_VALUE);
+            final Uri uri = IntentCompat.getParcelableExtra(intent, KEY_VALUE, Uri.class);
             if (uri == null) {
                 stopAndReportError(new IllegalStateException(
                         "Importing from input stream, but file path is null"),
@@ -111,8 +118,20 @@ public class SubscriptionsImportService extends BaseImportExportService {
             }
 
             try {
-                inputStream = new SharpInputStream(
-                        new StoredFileHelper(this, uri, DEFAULT_MIME).getStream());
+                final StoredFileHelper fileHelper = new StoredFileHelper(this, uri, DEFAULT_MIME);
+                inputStream = new SharpInputStream(fileHelper.getStream());
+                inputStreamType = fileHelper.getType();
+
+                if (inputStreamType == null || inputStreamType.equals(DEFAULT_MIME)) {
+                    // mime type could not be determined, just take file extension
+                    final String name = fileHelper.getName();
+                    final int pointIndex = name.lastIndexOf('.');
+                    if (pointIndex == -1 || pointIndex >= name.length() - 1) {
+                        inputStreamType = DEFAULT_MIME; // no extension, will fail in the extractor
+                    } else {
+                        inputStreamType = name.substring(pointIndex + 1);
+                    }
+                }
             } catch (final IOException e) {
                 handleError(e);
                 return START_NOT_STICKY;
@@ -184,12 +203,19 @@ public class SubscriptionsImportService extends BaseImportExportService {
 
                 .parallel(PARALLEL_EXTRACTIONS)
                 .runOn(Schedulers.io())
-                .map((Function<SubscriptionItem, Notification<ChannelInfo>>) subscriptionItem -> {
+                .map((Function<SubscriptionItem, Notification<Pair<ChannelInfo,
+                        List<ChannelTabInfo>>>>) subscriptionItem -> {
                     try {
-                        return Notification.createOnNext(ExtractorHelper
+                        final ChannelInfo channelInfo = ExtractorHelper
                                 .getChannelInfo(subscriptionItem.getServiceId(),
                                         subscriptionItem.getUrl(), true)
-                                .blockingGet());
+                                .blockingGet();
+                        return Notification.createOnNext(new Pair<>(channelInfo,
+                                Collections.singletonList(
+                                        ExtractorHelper.getChannelTab(
+                                                subscriptionItem.getServiceId(),
+                                                channelInfo.getTabs().get(0), true).blockingGet()
+                                )));
                     } catch (final Throwable e) {
                         return Notification.createOnError(e);
                     }
@@ -208,7 +234,7 @@ public class SubscriptionsImportService extends BaseImportExportService {
     }
 
     private Subscriber<List<SubscriptionEntity>> getSubscriber() {
-        return new Subscriber<List<SubscriptionEntity>>() {
+        return new Subscriber<>() {
             @Override
             public void onSubscribe(final Subscription s) {
                 subscription = s;
@@ -239,18 +265,19 @@ public class SubscriptionsImportService extends BaseImportExportService {
         };
     }
 
-    private Consumer<Notification<ChannelInfo>> getNotificationsConsumer() {
+    private Consumer<Notification<Pair<ChannelInfo,
+            List<ChannelTabInfo>>>> getNotificationsConsumer() {
         return notification -> {
             if (notification.isOnNext()) {
-                final String name = notification.getValue().getName();
+                final String name = notification.getValue().first.getName();
                 eventListener.onItemCompleted(!TextUtils.isEmpty(name) ? name : "");
             } else if (notification.isOnError()) {
                 final Throwable error = notification.getError();
                 final Throwable cause = error.getCause();
                 if (error instanceof IOException) {
-                    throw (IOException) error;
+                    throw error;
                 } else if (cause instanceof IOException) {
-                    throw (IOException) cause;
+                    throw cause;
                 } else if (ExceptionUtils.isNetworkRelated(error)) {
                     throw new IOException(error);
                 }
@@ -260,10 +287,12 @@ public class SubscriptionsImportService extends BaseImportExportService {
         };
     }
 
-    private Function<List<Notification<ChannelInfo>>, List<SubscriptionEntity>> upsertBatch() {
+    private Function<List<Notification<Pair<ChannelInfo, List<ChannelTabInfo>>>>,
+            List<SubscriptionEntity>> upsertBatch() {
         return notificationList -> {
-            final List<ChannelInfo> infoList = new ArrayList<>(notificationList.size());
-            for (final Notification<ChannelInfo> n : notificationList) {
+            final List<Pair<ChannelInfo, List<ChannelTabInfo>>> infoList =
+                    new ArrayList<>(notificationList.size());
+            for (final Notification<Pair<ChannelInfo, List<ChannelTabInfo>>> n : notificationList) {
                 if (n.isOnNext()) {
                     infoList.add(n.getValue());
                 }
@@ -280,9 +309,12 @@ public class SubscriptionsImportService extends BaseImportExportService {
     }
 
     private Flowable<List<SubscriptionItem>> importFromInputStream() {
+        Objects.requireNonNull(inputStream);
+        Objects.requireNonNull(inputStreamType);
+
         return Flowable.fromCallable(() -> NewPipe.getService(currentServiceId)
                 .getSubscriptionExtractor()
-                .fromInputStream(inputStream));
+                .fromInputStream(inputStream, inputStreamType));
     }
 
     private Flowable<List<SubscriptionItem>> importFromPreviousExport() {

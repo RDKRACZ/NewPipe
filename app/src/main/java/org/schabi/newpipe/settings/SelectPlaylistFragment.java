@@ -1,6 +1,7 @@
 package org.schabi.newpipe.settings;
 
-import android.app.Activity;
+import static org.schabi.newpipe.local.bookmark.MergedPlaylistManager.getMergedOrderedPlaylists;
+
 import android.os.Bundle;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -21,18 +22,17 @@ import org.schabi.newpipe.database.LocalItem;
 import org.schabi.newpipe.database.playlist.PlaylistLocalItem;
 import org.schabi.newpipe.database.playlist.PlaylistMetadataEntry;
 import org.schabi.newpipe.database.playlist.model.PlaylistRemoteEntity;
-import org.schabi.newpipe.error.ErrorActivity;
 import org.schabi.newpipe.error.ErrorInfo;
+import org.schabi.newpipe.error.ErrorUtil;
 import org.schabi.newpipe.error.UserAction;
 import org.schabi.newpipe.local.playlist.LocalPlaylistManager;
 import org.schabi.newpipe.local.playlist.RemotePlaylistManager;
-import org.schabi.newpipe.util.PicassoHelper;
+import org.schabi.newpipe.util.image.PicassoHelper;
 
 import java.util.List;
 import java.util.Vector;
 
 import io.reactivex.rxjava3.android.schedulers.AndroidSchedulers;
-import io.reactivex.rxjava3.core.Flowable;
 import io.reactivex.rxjava3.disposables.Disposable;
 
 public class SelectPlaylistFragment extends DialogFragment {
@@ -91,8 +91,7 @@ public class SelectPlaylistFragment extends DialogFragment {
         final LocalPlaylistManager localPlaylistManager = new LocalPlaylistManager(database);
         final RemotePlaylistManager remotePlaylistManager = new RemotePlaylistManager(database);
 
-        disposable = Flowable.combineLatest(localPlaylistManager.getPlaylists(),
-                remotePlaylistManager.getPlaylists(), PlaylistLocalItem::merge)
+        disposable = getMergedOrderedPlaylists(localPlaylistManager, remotePlaylistManager)
                 .observeOn(AndroidSchedulers.mainThread())
                 .subscribe(this::displayPlaylists, this::onError);
     }
@@ -105,8 +104,7 @@ public class SelectPlaylistFragment extends DialogFragment {
     }
 
     protected void onError(final Throwable e) {
-        final Activity activity = requireActivity();
-        ErrorActivity.reportErrorInSnackbar(activity, new ErrorInfo(e,
+        ErrorUtil.showSnackbar(requireActivity(), new ErrorInfo(e,
                 UserAction.UI_ERROR, "Loading playlists"));
     }
 
@@ -120,7 +118,7 @@ public class SelectPlaylistFragment extends DialogFragment {
 
             if (selectedItem instanceof PlaylistMetadataEntry) {
                 final PlaylistMetadataEntry entry = ((PlaylistMetadataEntry) selectedItem);
-                onSelectedListener.onLocalPlaylistSelected(entry.uid, entry.name);
+                onSelectedListener.onLocalPlaylistSelected(entry.getUid(), entry.name);
 
             } else if (selectedItem instanceof PlaylistRemoteEntity) {
                 final PlaylistRemoteEntity entry = ((PlaylistRemoteEntity) selectedItem);
